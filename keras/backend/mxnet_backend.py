@@ -315,6 +315,7 @@ class KerasSymbol(object):
     def __rsub__(self, other):
         return self.__neg__().__add__(other)
 
+    @keras_symbol_child    
     def __neg__(self):
         return KerasSymbol(self.symbol * (-1.0), neighbor=[self])
 
