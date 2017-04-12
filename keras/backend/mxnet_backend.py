@@ -2722,7 +2722,6 @@ def _preprocess_deconvnd_output(output_shape, dim_ordering):
 @keras_symbol_child
 def _convnd(x, kernel, strides, filter_dilation, border_mode='valid', dim_ordering='default',
             image_shape=None, filter_shape=None):
-    import pdb;pdb.set_trace()
     if dim_ordering == 'default':
         dim_ordering = image_dim_ordering()
     x = _preprocess_convnd_input(x, dim_ordering)
