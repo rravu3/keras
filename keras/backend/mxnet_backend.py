@@ -3,7 +3,7 @@ import mxnet as mx
 from mxnet import nd as T
 import numpy as np
 
-from .common import _FLOATX, floatx, _EPSILON, reset_uids, get_uid
+from .common import _FLOATX, floatx, _EPSILON, reset_uids, get_uid, image_dim_ordering, set_image_dim_ordering
 from numbers import Number
 from functools import wraps
 
@@ -11,6 +11,8 @@ _LEARNING_PHASE = 1
 _EXECUTOR = None
 _MODEL = None
 _REENTRY = False
+
+set_image_dim_ordering('th')
 
 
 def keras_symbol_child(func):
@@ -179,10 +181,6 @@ def to_dense(tensor):
     raise NotImplementedError
 
 
-def image_dim_ordering():
-    return 'th'
-
-
 class KerasContext(object):
     pass
 
@@ -315,7 +313,7 @@ class KerasSymbol(object):
     def __rsub__(self, other):
         return self.__neg__().__add__(other)
 
-    @keras_symbol_child    
+    @keras_symbol_child
     def __neg__(self):
         return KerasSymbol(self.symbol * (-1.0), neighbor=[self])
 
@@ -1727,7 +1725,6 @@ def normalize_batch_in_training(x, gamma, beta,
         beta = beta.symbol
     if isinstance(gamma, KerasSymbol):
         gamma = gamma.symbol
-    # normal, mean, var = mx.sym.BatchNorm(data=x, gamma=gamma.symbol, beta=beta.symbol, output_mean_var=True)
 
     mean = mx.sym.mean(data=x, axis=reduction_axes, keepdims=False)
     var = _var(x, axis=reduction_axes, keepdims=False)
@@ -1773,13 +1770,19 @@ def batch_normalization(x, mean, var, beta, gamma, epsilon=1e-3):
     if isinstance(gamma, KerasSymbol):
         gamma = gamma.symbol
 
+    mean = mx.sym.stop_gradient(mean)
+    var = mx.sym.stop_gradient(var)
+
+    # gradient explode when learning gamma and beta at together.
+    gamma = mx.sym.stop_gradient(gamma)
+
     std = mx.sym.sqrt(data=var + epsilon)
 
-    minus0 = mx.sym.broadcast_minus(x, mean)
-    div0 = mx.sym.broadcast_div(gamma, std)
-    mul0 = mx.sym.broadcast_mul(minus0, div0)
-    rval = mx.sym.broadcast_plus(mul0, beta)
-    return KerasSymbol(rval)
+    x = mx.sym.broadcast_minus(x, mean)
+    x = mx.sym.broadcast_div(x, std)
+    x = mx.sym.broadcast_mul(x, gamma)
+    x = mx.sym.broadcast_plus(x, beta)
+    return KerasSymbol(x)
 
 
 # SHAPE OPERATIONS
@@ -1831,7 +1834,14 @@ def resize_images(X, height_factor, width_factor, dim_ordering):
     # Returns
         A tensor.
     """
-    raise NotImplementedError
+    x = X.symbol
+    if dim_ordering == 'tf':
+        x = mx.sym.repeat(x, repeats=height_factor, axis=1)
+        x = mx.sym.repeat(x, repeats=width_factor, axis=2)
+    else:
+        x = mx.sym.repeat(x, repeats=height_factor, axis=2)
+        x = mx.sym.repeat(x, repeats=width_factor, axis=3)
+    return KerasSymbol(x)
 
 
 @keras_symbol_child
@@ -1845,7 +1855,16 @@ def resize_volumes(X, depth_factor, height_factor, width_factor, dim_ordering):
     # Returns
         A tensor.
     """
-    raise NotImplementedError
+    x = X.symbol
+    if dim_ordering == 'tf':
+        x = mx.sym.repeat(x, repeats=depth_factor, axis=1)
+        x = mx.sym.repeat(x, repeats=height_factor, axis=2)
+        x = mx.sym.repeat(x, repeats=width_factor, axis=3)
+    else:
+        x = mx.sym.repeat(x, repeats=depth_factor, axis=2)
+        x = mx.sym.repeat(x, repeats=height_factor, axis=3)
+        x = mx.sym.repeat(x, repeats=width_factor, axis=4)
+    return KerasSymbol(x)
 
 
 @keras_symbol_child
@@ -2012,6 +2031,7 @@ def spatial_2d_padding(x, padding=(1, 1), dim_ordering='default'):
         pattern = (0, 0, 0, 0,
                    padding[0], padding[0], padding[1], padding[1])
     else:
+        raise NotImplementedError("mxnet doesn't support padding with tf dim ordering")
         pattern = (0, 0,
                    padding[0], padding[0], padding[1], padding[1],
                    0, 0)
@@ -2042,6 +2062,7 @@ def asymmetric_spatial_2d_padding(x, top_pad=1, bottom_pad=1,
                    top_pad, bottom_pad,
                    left_pad, right_pad)
     else:
+        raise NotImplementedError("mxnet doesn't support padding with tf dim ordering")
         pattern = (0, 0,
                    top_pad, bottom_pad,
                    left_pad, right_pad,
@@ -2110,7 +2131,7 @@ def one_hot(indices, nb_classes):
     # Returns
         The one-hot tensor.
     """
-    raise NotImplementedError
+    return KerasSymbol(mx.symbol.one_hot(indices.symbol, depth=nb_classes))
 
 
 @keras_symbol_child
@@ -2311,6 +2332,8 @@ def rnn(step_function, inputs, initial_states,
     states = initial_states
     outputs = []
     prev_output = None
+    if constants is None:
+        constants = []
     for i, m in zip(inputs, masks):
         output, new_states = step_function(KerasSymbol(i), states + constants)
         if m is not None:
@@ -2409,8 +2432,9 @@ def relu(x, alpha=0., max_value=None):
                                 act_type='relu')
     if max_value is not None:
         if isinstance(max_value, KerasSymbol):
-            max_value = max_value.symbol
-        ret = mx.sym.broadcast_minimum(ret, max_value)
+            ret = mx.sym.broadcast_minimum(ret, max_value.symbol)
+        else:
+            ret = mx.sym.minimum(ret, max_value)
     return KerasSymbol(ret)
 
 
@@ -2502,8 +2526,9 @@ def binary_crossentropy(output, target, from_logits=False):
     # Returns
         A tensor.
     """
-    assert not from_logits
     output = output.symbol
+    if from_logits:
+        output = mx.sym.Activation(output, act_type='sigmoid')
     output = mx.sym.clip(output, a_min=_EPSILON, a_max=1. - _EPSILON)
     output = -(target.symbol * mx.sym.log(output) + (1.0 - target.symbol) * mx.sym.log(1.0 - output))
     return KerasSymbol(output)
@@ -2609,31 +2634,57 @@ def in_top_k(predictions, targets, k):
 
 # CONVOLUTIONS
 @keras_symbol_child
-def _preprocess_conv2d_input(x, dim_ordering):
-    if dim_ordering == 'tf':
+def _preprocess_convnd_input(x, dim_ordering):
+    if dim_ordering == 'tf' and ndim(x) > 3:
         # TF uses the last dimension as channel dimension,
         # instead of the 2nd one.
         # TH input shape: (samples, input_depth, rows, cols)
         # TF input shape: (samples, rows, cols, input_depth)
-        x = KerasSymbol(mx.sym.transpose(x.symbol, axes=(0, 3, 1, 2)))
+        idx = list(range(ndim(x)))
+        idx.insert(1, idx.pop(-1))
+        x = KerasSymbol(mx.sym.transpose(x.symbol, axes=idx))
     return x
 
 
 @keras_symbol_child
-def _preprocess_conv2d_kernel(kernel, dim_ordering):
-    if dim_ordering == 'tf':
+def _preprocess_convnd_kernel(kernel, dim_ordering):
+    if dim_ordering == 'tf' and len(kernel.shape) > 3:
         # TF uses the last dimension as channel dimension,
         # instead of the 2nd one.
         # TH kernel shape: (depth, input_depth, rows, cols)
         # TF kernel shape: (rows, cols, input_depth, depth)
-        kernel = KerasSymbol(mx.sym.transpose(kernel.symbol, axes=(3, 2, 0, 1)))
+        idx = list(range(len(kernel.shape)))
+        idx.insert(0, idx.pop(-2))
+        idx.insert(0, idx.pop(-1))
+        kernel = KerasSymbol(mx.sym.transpose(kernel.symbol, axes=idx))
     return kernel
 
 
 @keras_symbol_child
-def _postprocess_conv2d_output(x, dim_ordering):
-    if dim_ordering == 'tf':
-        x = KerasSymbol(mx.sym.transpose(x.symbol, axes=(0, 2, 3, 1)))
+def _preprocess_deconvnd_kernel(kernel, dim_ordering):
+    idx = list(range(len(kernel.shape)))
+    if dim_ordering == 'tf' and len(kernel.shape) > 3:
+        # TF uses the last dimension as channel dimension,
+        # instead of the 2nd one.
+        # TH kernel shape: (depth, input_depth, rows, cols)
+        # TF kernel shape: (rows, cols, input_depth, depth)
+        idx.insert(0, idx.pop(-2))
+        idx.insert(0, idx.pop(-1))
+    idx[0], idx[1] = idx[1], idx[0]
+    kernel = KerasSymbol(mx.sym.transpose(kernel.symbol, axes=idx))
+    return kernel
+
+
+@keras_symbol_child
+def _postprocess_convnd_output(x, dim_ordering):
+    if dim_ordering == 'tf' and ndim(x) > 3:
+        # TF uses the last dimension as channel dimension,
+        # instead of the 2nd one.
+        # TH input shape: (samples, input_depth, rows, cols)
+        # TF input shape: (samples, rows, cols, input_depth)
+        idx = list(range(ndim(x)))
+        idx.append(idx.pop(1))
+        x = KerasSymbol(mx.sym.transpose(x.symbol, axes=idx))
     return x
 
 
@@ -2645,26 +2696,49 @@ def _calculation_pad(input_shape, kernel, strides, dilation, border_mode):
 
 
 def _preprocess_border_mode(border_mode, input_shape, kernel, strides, dilation):
-    is_slice = (False, False)
-    out_size = (0, 0)
+    nd = len(input_shape) - 2
+    is_slice = (False,)*nd
+    out_size = (0)*nd
     if border_mode == 'same' or  border_mode == 'full':
-        padding, is_slice, out_size \
-            = zip(_calculation_pad(input_shape[2], kernel[0], strides[0], dilation[0], border_mode),
-                  _calculation_pad(input_shape[3], kernel[1], strides[1], dilation[1], border_mode))
+        padding, is_slice, out_size = zip(
+            *[_calculation_pad(input_shape[2+i], kernel[i], strides[i], dilation[i], border_mode) \
+              for i in range(nd)])
     elif border_mode == 'valid':
-        padding = (0, 0)
+        padding = (0,)*nd
     else:
         raise ValueError('Invalid border mode:', border_mode)
     return padding, np.any(is_slice), out_size
 
-def _preprocess_deconv2d_output(output_shape, dim_ordering):
+def _preprocess_deconvnd_output(output_shape, dim_ordering):
     if dim_ordering == 'default':
         output_shape = image_dim_ordering()
     if dim_ordering == 'th':
         output_shape = output_shape[2:]
     if dim_ordering == 'tf':
-        output_shape = output_shape[1:3]
+        output_shape = output_shape[1:-1]
     return output_shape
+
+
+@keras_symbol_child
+def _convnd(x, kernel, strides, filter_dilation, border_mode='valid', dim_ordering='default',
+            image_shape=None, filter_shape=None):
+    import pdb;pdb.set_trace()
+    if dim_ordering == 'default':
+        dim_ordering = image_dim_ordering()
+    x = _preprocess_convnd_input(x, dim_ordering)
+    kernel = _preprocess_convnd_kernel(kernel, dim_ordering)
+    layout_kernel, nb_filter = _layout_kernel("th", kernel.shape)
+    padding, is_slice, out_size = _preprocess_border_mode(border_mode, x.shape, layout_kernel, strides, filter_dilation)
+    s = mx.sym.Convolution(data=x.symbol, name=kernel.name, kernel=layout_kernel, stride=strides, pad=padding,
+                           num_filter=nb_filter, weight=kernel.symbol, dilate=filter_dilation,  no_bias=True)
+    if is_slice:
+        begin = (0, 0) + (0,)*len(out_size)
+        end = (None, None) + tuple(out_size)
+        s = mx.sym.slice(s, begin=begin, end=end)
+
+    out = _postprocess_convnd_output(KerasSymbol(s), dim_ordering)
+    return out
+
 
 @keras_symbol_child
 def conv1d(x, kernel, stride=1, border_mode='valid',
@@ -2679,7 +2753,8 @@ def conv1d(x, kernel, stride=1, border_mode='valid',
     # Returns
         A tensor, result of 1D convolution.
     """
-    raise NotImplementedError
+    return _convnd(x, kernel, strides=(stride,), filter_dilation=(1,), border_mode=border_mode,
+                   dim_ordering='tf', image_shape=image_shape, filter_shape=filter_shape)
 
 
 @keras_symbol_child
@@ -2699,19 +2774,9 @@ def conv2d(x, kernel, strides=(1, 1), border_mode='valid',
     # Returns
         A tensor, result of 2D convolution.
     """
-
-    x = _preprocess_conv2d_input(x, dim_ordering)
-    kernel = _preprocess_conv2d_kernel(kernel, dim_ordering)
-    layout_kernel, nb_filter = _layout_kernel2("th", kernel.shape)
-    padding, is_slice, out_size = _preprocess_border_mode(border_mode, x.shape, layout_kernel, strides, filter_dilation)
-    s = mx.sym.Convolution(data=x.symbol, name=kernel.name, kernel=layout_kernel, stride=strides, pad=padding,
-                           num_filter=nb_filter, weight=kernel.symbol, dilate=filter_dilation,  no_bias=True)
-    if is_slice:
-        s = mx.sym.slice(s, begin=(0, 0, 0, 0), end=(None, None, out_size[0], out_size[1]))
-        pass
-
-    out = _postprocess_conv2d_output(KerasSymbol(s), dim_ordering)
-    return out
+    return _convnd(x, kernel, strides=strides, filter_dilation=filter_dilation,
+                   border_mode=border_mode, dim_ordering=dim_ordering,
+                   image_shape=image_shape, filter_shape=filter_shape)
 
 
 @keras_symbol_child
@@ -2734,11 +2799,17 @@ def deconv2d(x, kernel, output_shape, strides=(1, 1),
     # Returns
         A tensor, result of transposed 2D convolution.
     """
-    layout_kernel, nb_filter = _layout_kernel2(dim_ordering, kernel.shape)
-    output_shape = _preprocess_deconv2d_output(output_shape, dim_ordering)
+    if dim_ordering == 'default':
+        dim_ordering = image_dim_ordering()
+    x = _preprocess_convnd_input(x, dim_ordering)
+    layout_kernel, nb_filter = _layout_kernel(dim_ordering, kernel.shape)
+    kernel = _preprocess_deconvnd_kernel(kernel, dim_ordering)
+    output_shape = _preprocess_deconvnd_output(output_shape, dim_ordering)
     s = mx.sym.Deconvolution(data=x.symbol, name=kernel.name, kernel=layout_kernel, stride=strides,
                              num_filter=nb_filter, weight=kernel.symbol, no_bias=True, target_shape=output_shape)
-    return KerasSymbol(s)
+
+    out = _postprocess_convnd_output(KerasSymbol(s), dim_ordering)
+    return out
 
 
 @keras_symbol_child
@@ -2762,7 +2833,9 @@ def atrous_conv2d(x, kernel, rate=1,
     # Returns
         A tensor, result of atrous transposed 2D convolution.
     """
-    raise NotImplementedError
+    return conv2d(x, kernel, border_mode=border_mode, dim_ordering=dim_ordering,
+                  image_shape=image_shape, filter_shape=filter_shape,
+                  filter_dilation=(rate, rate))
 
 
 @keras_symbol_child
@@ -2790,10 +2863,10 @@ def conv3d(x, kernel, strides=(1, 1, 1),
     # Returns
         A tensor, result of 3D convolution.
     """
-    layout_kernel, nb_filter = _layout_kernel3(dim_ordering, kernel.shape)
-    s = mx.sym.Convolution(data=x.symbol, name=kernel.name, kernel=layout_kernel, stride=strides,
-                           num_filter=nb_filter, weight=kernel.symbol, no_bias=True)
-    return KerasSymbol(s)
+    return _convnd(x, kernel, strides=strides, filter_dilation=(1,1,1),
+                   border_mode=border_mode,
+                   dim_ordering=dim_ordering, image_shape=volume_shape,
+                   filter_shape=filter_shape)
 
 
 @keras_symbol_child
@@ -2812,10 +2885,12 @@ def pool2d(x, pool_size, strides=(1, 1),
     # Returns
         A tensor, result of 2D pooling.
     """
-    x = _preprocess_conv2d_input(x, dim_ordering)
+    if dim_ordering == 'default':
+        dim_ordering = image_dim_ordering()
+    x = _preprocess_convnd_input(x, dim_ordering)
     s = mx.sym.Pooling(data=x.symbol, kernel=pool_size, pool_type=pool_mode, pooling_convention=border_mode,
                        stride=strides)
-    out = _postprocess_conv2d_output(KerasSymbol(s), dim_ordering)
+    out = _postprocess_convnd_output(KerasSymbol(s), dim_ordering)
     return out
 
 
@@ -2834,10 +2909,13 @@ def pool3d(x, pool_size, strides=(1, 1, 1), border_mode='valid',
     # Returns
         A tensor, result of 3D pooling.
     """
-    raise NotImplementedError
+    if dim_ordering == 'default':
+        dim_ordering = image_dim_ordering()
+    x = _preprocess_convnd_input(x, dim_ordering)
     s = mx.sym.Pooling(data=x.symbol, kernel=pool_size, pool_type=pool_mode, pooling_convention=border_mode,
                        stride=strides)
-    return KerasSymbol(s)
+    out = _postprocess_convnd_output(KerasSymbol(s), dim_ordering)
+    return out
 
 
 @keras_symbol_child
@@ -2999,29 +3077,15 @@ def foldr(fn, elems, initializer=None, name=None):
     raise NotImplementedError
 
 
-def _layout_kernel2(dim_ordering, kernel):
+def _layout_kernel(dim_ordering, kernel):
     if dim_ordering == 'default':
         dim_ordering = image_dim_ordering()
     if dim_ordering == 'th':
-        layout_kernel = (kernel[2], kernel[3])
+        layout_kernel = tuple(kernel[2:])
         nb_filter = kernel[0]
     elif dim_ordering == 'tf':
-        layout_kernel = (kernel[0], kernel[1])
-        nb_filter = kernel[3]
-    else:
-        raise ValueError('Unknown dim_ordering ' + str(dim_ordering))
-    return layout_kernel, nb_filter
-
-
-def _layout_kernel3(dim_ordering, kernel):
-    if dim_ordering == 'default':
-        dim_ordering = image_dim_ordering()
-    if dim_ordering == 'th':
-        layout_kernel = (kernel[2], kernel[3])
-        nb_filter = kernel[0]
-    elif dim_ordering == 'tf':
-        layout_kernel = (kernel[0], kernel[1])
-        nb_filter = kernel[3]
+        layout_kernel = tuple(kernel[:-2])
+        nb_filter = kernel[-1]
     else:
         raise ValueError('Unknown dim_ordering ' + str(dim_ordering))
     return layout_kernel, nb_filter

@@ -89,7 +89,8 @@ def layer_test(layer_cls, kwargs={}, input_shape=None, input_dtype=None,
     for expected_dim, actual_dim in zip(expected_output_shape,
                                         actual_output_shape):
         if expected_dim is not None:
-            assert expected_dim == actual_dim
+            assert expected_dim == actual_dim, \
+                '%s vs %s'%(expected_output_shape, actual_output_shape)
     if expected_output is not None:
         assert_allclose(actual_output, expected_output, rtol=1e-3)
 

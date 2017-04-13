@@ -677,7 +677,8 @@ if K.backend() == 'mxnet':
     class RMSprop(MXOptimizer, K.mx.optimizer.RMSProp):
         def __init__(self, lr=0.001, rho=0.9, epsilon=1e-8, decay=0., clipnorm=None, **kwargs):
             # TODO: Map all parameters
-            K.mx.optimizer.RMSProp.__init__(self, learning_rate=lr, wd=rho, clip_gradient=clipnorm, **kwargs)
+            K.mx.optimizer.RMSProp.__init__(self, learning_rate=lr, gamma1=rho, epsilon=epsilon,
+                                            clip_gradient=clipnorm, **kwargs)
             MXOptimizer.__init__(self, lr, decay)
 # Aliases.
 
