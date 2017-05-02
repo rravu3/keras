@@ -3092,22 +3092,19 @@ def _layout_kernel(dim_ordering, kernel):
 
 def dfs_get_bind_values(node_start):
     stack_list = []
-    visited = {node_start: node_start}
+    visited = set()
     stack_list.append(node_start)
     while len(stack_list) > 0:
-        cur_node = stack_list[-1]
+        cur_node = stack_list.pop()
+        if cur_node in visited:
+            continue
+        visited.add(cur_node)
         next_nodes = cur_node.get_neighbor()
-        if len(next_nodes) == 0:
-            stack_list.pop()
-        else:
-            if len(set(next_nodes) - set(visited.keys())) == 0:
-                stack_list.pop()
+        for i in next_nodes:
+            if i in visited:
+                continue
             else:
-                for i in next_nodes:
-                    if i not in visited:
-                        visited[i] = i
-                        stack_list.append(i)
-                        break
+                stack_list.append(i)
     bind_values = {}
     for key in visited:
         bind_values.update(key.get_bind_values())
